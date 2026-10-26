@@ -64,6 +64,25 @@ class MerchantApp:
                 return p
         return None
 
+    def save_products(self):
+        """Persist the current in-memory product list back to products.json,
+        preserving the rest of the document (_note, servers). Atomic via a
+        temp file + replace. Returns True on success, False on any error."""
+        import json
+        import os
+        path = self.config["products_path"]
+        try:
+            with self.lock:
+                doc = store.load_json(path, {"products": []})
+                doc["products"] = self.products
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(doc, f, indent=2, ensure_ascii=False)
+                os.replace(tmp, path)
+            return True
+        except Exception:
+            return False
+
     # -- endpoints -------------------------------------------------------
     def role_check(self, body):
         if self._bad_sign(body):

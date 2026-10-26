@@ -90,6 +90,23 @@ class Bot:
                          f"Total spent: {stats['total_spent']:.2f} BRL",
                          reply_markup=self.admin_menu_keyboard())
 
+    @staticmethod
+    def _pack_label(p):
+        # Short unique button label (Telegram caps button text at 64 bytes).
+        if p.get("diamonds"):
+            return f"#{p['pid']} · {p['diamonds']}💎 - {p['price']}"
+        return f"{p['name'].replace('MLBB ', '')} - {p['price']}"
+
+    def show_admin_packs(self, chat_id):
+        rows = []
+        for i in range(0, len(self.merchant.products), 2):
+            rows.append([{"text": self._pack_label(p),
+                          "callback_data": f"admin:pack:{p['pid']}"}
+                         for p in self.merchant.products[i:i + 2]])
+        rows.append([{"text": "⬅️ Admin menu", "callback_data": "admin:menu"}])
+        return self.send(chat_id, "💎 Set pack prices — tap a pack:",
+                         reply_markup={"inline_keyboard": rows})
+
     def _balance_text(self, chat_id):
         bal = store.get_balance(self.conn, chat_id)
         return (f"💰 <b>Your wallet balance: {bal['balance']:.2f} BRL</b>\n"
@@ -295,6 +312,24 @@ class Bot:
             if result is None:
                 return self.send(chat_id, "Could not adjust - not enough balance to deduct that much.")
             return self.send(chat_id, f"User {target} balance is now {result['balance']:.2f} BRL.")
+        # Admin set pack price: number typed after tapping Set new price
+        if sess and sess.get("step") == "admin_set_price" and self.is_admin(chat_id):
+            pid = sess.get("admin_price_pid")
+            product = self.merchant.find_product(pid) if pid else None
+            try:
+                value = float(text.strip().replace(",", "."))
+            except Exception:
+                value = -1
+            if not product or value <= 0:
+                return self.send(chat_id, "Send a valid price above 0, e.g. 6.50.")
+            old = product["price"]
+            product["price"] = f"{value:.2f}"
+            if self.merchant.save_products():
+                self.sessions.pop(chat_id, None)
+                return self.send(chat_id,
+                                 f"✅ {product['name']} price updated: {old} → {product['price']} BRL.")
+            product["price"] = old
+            return self.send(chat_id, "Could not save the new price — nothing changed. Try again.")
         # Region quick order: /<region> <MLBB ID> <Zone ID> <diamonds>
         # e.g. /brl 603803877 5674 86
         rm = re.match(r"^/([a-z]{2,3})(?:\s+(\S+))?(?:\s+(\S+))?(?:\s+(\S+))?\s*$", text.strip().lower())
@@ -561,8 +596,29 @@ class Bot:
                                  f"Status: {order['status']} / Trade: {order['trade_no']}",
                                  reply_markup=kb)
             if data == "admin:packs":
-                self.send(chat_id, self.packs_text())
-                return self.send(chat_id, "Back to admin:", reply_markup=self.admin_menu_keyboard())
+                return self.show_admin_packs(chat_id)
+            if data.startswith("admin:pack:"):
+                pid = data.split(":", 2)[2]
+                product = self.merchant.find_product(pid)
+                if not product:
+                    return self.send(chat_id, "Pack not found.")
+                kb = {"inline_keyboard": [
+                    [{"text": "✏️ Set new price", "callback_data": f"admin:setprice:{pid}"}],
+                    [{"text": "⬅️ Packs", "callback_data": "admin:packs"},
+                     {"text": "⬅️ Admin menu", "callback_data": "admin:menu"}],
+                ]}
+                return self.send(chat_id,
+                                 f"💎 {product['name']}\n"
+                                 f"Current price: {product['price']} {product.get('currency', 'BRL')}",
+                                 reply_markup=kb)
+            if data.startswith("admin:setprice:"):
+                pid = data.split(":", 2)[2]
+                product = self.merchant.find_product(pid)
+                if not product:
+                    return self.send(chat_id, "Pack not found.")
+                self.sessions[chat_id] = {"step": "admin_set_price", "admin_price_pid": pid}
+                return self.send(chat_id,
+                                 f"Send the new price for {product['name']} in BRL (e.g. 6.50).")
             return None
         if data == "menu:main":
             return self.start(chat_id)
