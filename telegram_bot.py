@@ -148,10 +148,18 @@ class Bot:
         payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
         if reply_markup:
             payload["reply_markup"] = json.dumps(reply_markup)
-        try:
-            return self.api("sendMessage", payload)
-        except Exception as e:
-            print("[telegram] send failed:", e)
+        # Retry with backoff: PythonAnywhere's free outbound proxy
+        # intermittently answers 503, which used to drop the reply silently.
+        for attempt in (1, 2, 3):
+            try:
+                return self.api("sendMessage", payload)
+            except Exception as e:
+                if attempt < 3:
+                    print(f"[telegram] send attempt {attempt} failed, "
+                          f"retrying: {e}")
+                    time.sleep(2 * attempt - 1)  # 1s, then 3s
+                else:
+                    print("[telegram] send failed:", e)
 
     def notify_delivered(self, order):
         chat_id = order.get("telegram_chat_id")
