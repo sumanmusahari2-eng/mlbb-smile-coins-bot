@@ -1,0 +1,1 @@
+{"_note":"DEMO ONLY. In production, verify_role() in merchant_server.py must query your real game-account system. These demo entries only let you test the flow end to end.","roles":{"123456789":{"nickname":"DemoPlayer","sid":"1234"},"987654321":{"nickname":"TestHero","sid":"4321"}}}

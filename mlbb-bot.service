@@ -1,0 +1,22 @@
+# MLBB bot - hosted test service (template, for a Linux server / VPS)
+# Install: copy this file to /etc/systemd/system/mlbb-bot.service,
+# put TELEGRAM_BOT_TOKEN and SMILEONE_MERCHANT_KEY in
+# /etc/mlbb-bot.env (chmod 600), edit WorkingDirectory, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mlbb-bot
+#   sudo systemctl status mlbb-bot
+[Unit]
+Description=MLBB Smile Coins Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/youruser/mlbb-smile-coins-bot
+EnvironmentFile=/etc/mlbb-bot.env
+ExecStart=/usr/bin/python3 app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
