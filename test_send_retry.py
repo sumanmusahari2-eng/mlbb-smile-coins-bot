@@ -23,10 +23,15 @@ def main():
     assert r == {"ok": True, "result": {"message_id": 1}}, r
     assert b.calls == 3, b.calls
 
-    b = FakeBot(5)
+    b = FakeBot(4)
+    r = b.send(123, "hi")
+    assert r == {"ok": True, "result": {"message_id": 1}}, r
+    assert b.calls == 5, b.calls
+
+    b = FakeBot(9)
     r = b.send(123, "hi")
     assert r is None, r
-    assert b.calls == 3, b.calls
+    assert b.calls == 5, b.calls
 
     print("send retry tests passed")
 

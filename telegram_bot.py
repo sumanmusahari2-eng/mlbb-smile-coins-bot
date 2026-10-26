@@ -53,7 +53,7 @@ REGIONS = {
 
 class Bot:
     def __init__(self, token, conn, config, merchant_app: MerchantApp):
-        self.token = token
+        self.token = (token or "").strip()
         self.conn = conn
         self.config = config
         self.merchant = merchant_app
@@ -158,7 +158,7 @@ class Bot:
     def api(self, method, payload):
         data = urllib.parse.urlencode(payload).encode()
         req = urllib.request.Request(API + self.token + "/" + method, data=data)
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read())
 
     def send(self, chat_id, text, reply_markup=None):
@@ -167,14 +167,17 @@ class Bot:
             payload["reply_markup"] = json.dumps(reply_markup)
         # Retry with backoff: PythonAnywhere's free outbound proxy
         # intermittently answers 503, which used to drop the reply silently.
-        for attempt in (1, 2, 3):
+        # 5 attempts with 1s/2s/4s/8s backoff: a reply survives proxy
+        # outages of ~15s, while the 10s per-attempt timeout bounds the
+        # worst case so the webhook still answers Telegram in time.
+        for attempt in (1, 2, 3, 4, 5):
             try:
                 return self.api("sendMessage", payload)
             except Exception as e:
-                if attempt < 3:
+                if attempt < 5:
                     print(f"[telegram] send attempt {attempt} failed, "
                           f"retrying: {e}")
-                    time.sleep(2 * attempt - 1)  # 1s, then 3s
+                    time.sleep(2 ** (attempt - 1))  # 1s, 2s, 4s, 8s
                 else:
                     print("[telegram] send failed:", e)
 
