@@ -1,4 +1,5 @@
-"""Fresh Telegram ordering bot, built from the Smile.one Docs order lifecycle.
+"""Telegram ordering bot, built from the Smile.one Docs order lifecycle,
+now multi-region like the reference reseller bot (BR + PH).
 
 Docs model (docs.smile.one: "APIs and parameters that merchants need to
 provide to Smile One"):
@@ -9,47 +10,60 @@ provide to Smile One"):
                       confirms the order is paid.
   5. Delivery      -> the merchant delivers the items, order = DELIVERED.
 
-This bot is the customer-facing side of that lifecycle, written clean
-from the beginning (the old telegram_bot.py mixed admin panels, fund
-requests, region shortcuts and a wallet flow into one file):
+Customer commands:
+  /start  -> welcome + per-region balances + order examples + menu
+  /getid  -> your Telegram account ID
+  /help   -> all commands list
+  /packs  -> list all packs and prices
+  /orders -> list your orders and their status
+  /balance -> per-region wallet balances
+  /br <uid> <sid> <diamonds> [more triplets...] -> quick order, BR
+  /ph <uid> <sid> <diamonds> [more triplets...] -> quick order, PH
+  /addfund [region] <amount> -> test-mode credit only (see below)
+  /admin  -> admin panel (stats + pack prices, ADMIN_CHAT_IDS only)
 
-  /start  -> menu -> Top Up -> pick a pack -> send MLBB ID
-          -> send Zone ID -> confirm -> pay from wallet
-  /packs   -> list all packs and prices
-  /orders  -> list your orders and their status
-  /balance -> check your wallet balance
-  /addfund <amount> -> test-mode credit only (see below)
-  /help    -> how ordering works
+Bulk: one /br or /ph command can carry up to 10 orders (triplets of
+uid + sid + diamonds). The bot validates every triplet first, shows
+one summary with a total, and charges the region wallet once on
+confirm. Anything invalid cancels the whole batch — no partial orders.
+
+Menu flow: /start -> Top Up -> pick region -> pick pack -> send MLBB
+ID -> send Zone ID -> confirm -> pay from that region's wallet.
 
 Order states: PENDING -> PAID -> DELIVERED.
-  * Wallet payment deducts the balance and moves the order to PAID.
-  * A Smile.one payment notification (handle_payment_notification, sign
-    verified with the merchant key) also moves an order to PAID.
-  * Delivery is a pluggable hook (deliver=...). The shipped default does
-    NOT pretend to deliver: it logs the delivery request and returns
+  * Wallet payment deducts the region balance and moves orders to PAID.
+  * A Smile.one payment notification (sign-verified) also moves an
+    order to PAID.
+  * Delivery is a pluggable hook (deliver=...). The shipped default
+    does NOT pretend to deliver: it logs the request and returns
     False, so a paid order stays PAID and the customer is told the
-    merchant will complete delivery. Wire a real supplier/fulfilment
-    call here and paid orders become DELIVERED automatically, with a
+    merchant will complete delivery. Wire a real supplier call here
+    and paid orders become DELIVERED automatically, with a
     confirmation message to the customer.
 
 Honest limits, stated in the code and in the messages, not hidden:
   * Nickname lookup: the docs do not publish a merchant-to-Smile.one
     role-query API, so this bot does NOT fake a nickname. The confirm
     screen shows the exact MLBB ID + Zone ID back and the customer
-    confirms them. If Smile.one staff confirm a real lookup, add it
-    in the confirm step.
+    confirms them.
   * /addfund is TEST ONLY while auto_credit_test is on: it credits
     instantly so the order flow can be tested with no payment rail.
-    Turn it off before any real use; real funding needs a payment
-    method, which this bot does not invent.
+    Turn it off before any real use.
   * No checkout URL is invented: the docs publish no direct
     Smile Coins debit URL, so this bot never shows a fake pay link.
+  * PH packs are only offered once their official list is verified.
+    Until then /ph and the PH menu answer that PH is not available
+    yet — no invented PH prices, ever.
+
+Wallets: one wallet per region (store.region_balances). The old
+single wallet balance carries into BR exactly once, on first access.
 
 Stdlib only. No token or network is needed to test: pass a fake
 sender= callable and the whole flow runs against an in-memory DB
 (see test_order_bot.py).
 """
 import json
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -59,6 +73,13 @@ from merchant_server import MerchantApp
 
 API = "https://api.telegram.org/bot"
 PER_PAGE = 8
+BULK_MAX = 10
+
+REGIONS = {
+    "BR": {"name": "Brazil", "flag": "🇧🇷", "currency": "BRL"},
+    "PH": {"name": "Philippines", "flag": "🇵🇭", "currency": "PHP"},
+}
+CURRENCY_REGION = {"BRL": "BR", "PHP": "PH"}
 
 
 def _kb(rows):
@@ -93,14 +114,20 @@ class OrderMerchantApp(MerchantApp):
 
 class OrderBot:
     def __init__(self, token, conn, products, sender=None, deliver=None,
-                 auto_credit_test=False, admin_chat_ids="", merchant=None):
+                 auto_credit_test=False, admin_chat_ids="", merchant=None,
+                 regions_products=None, save_region=None):
         self.token = (token or "").strip()
         self.conn = conn
+        # products = BR list (backward compatible). regions_products
+        # overrides per region when given; BR must be the same list
+        # object as merchant.products so admin price saves stick.
         self.products = products
+        self.regions_products = regions_products or {"BR": products}
+        self.save_region = save_region
         self.sender = sender  # fake sender for tests: fn(chat_id, text, kb)
         self.deliver = deliver
         self.auto_credit_test = auto_credit_test
-        self.merchant = merchant  # OrderMerchantApp, for admin price saves
+        self.merchant = merchant  # OrderMerchantApp, for BR price saves
         raw_admins = admin_chat_ids or ""
         self.admin_ids = {int(x) for x in str(raw_admins).split(",")
                           if x.strip().isdigit()}
@@ -111,17 +138,47 @@ class OrderBot:
         return chat_id in self.admin_ids
 
     # -- products ------------------------------------------------------
-    def find_product(self, pid):
-        for p in self.products:
+    def region_products(self, region):
+        return self.regions_products.get(region, [])
+
+    def find_product(self, pid, region="BR"):
+        for p in self.region_products(region):
             if str(p["pid"]) == str(pid):
                 return p
         return None
 
-    def packs_text(self):
-        lines = ["💎 <b>MLBB Packs</b>:"]
-        for p in self.products:
-            lines.append(f"{p['name']} - {p['price']} {p.get('currency', 'BRL')}")
+    def find_pack_by_diamonds(self, diamonds, region="BR"):
+        for p in self.region_products(region):
+            try:
+                if int(p.get("diamonds", 0)) == int(diamonds):
+                    return p
+            except Exception:
+                continue
+        return None
+
+    def packs_text(self, region="BR"):
+        info = REGIONS[region]
+        lines = [f"💎 <b>MLBB Packs — {info['flag']} {info['name']}</b>:"]
+        for p in self.region_products(region):
+            lines.append(f"{p['name']} - {p['price']} {info['currency']}")
         return "\n".join(lines)
+
+    def _save_region(self, region):
+        if region == "BR" and self.merchant is not None:
+            return self.merchant.save_products()
+        if self.save_region is not None:
+            return self.save_region(region)
+        return False
+
+    # -- balances --------------------------------------------------------
+    def balance_lines(self, chat_id):
+        lines = []
+        for code in ("BR", "PH"):
+            info = REGIONS[code]
+            bal = store.get_region_balance(self.conn, chat_id, code)
+            lines.append(f"Balance {info['flag']} [{code}]: "
+                         f"{bal['balance']:.2f} {info['currency']}")
+        return lines
 
     # -- Telegram transport --------------------------------------------
     def api(self, method, payload):
@@ -148,6 +205,27 @@ class OrderBot:
                 else:
                     print("[telegram] send failed:", e)
 
+    def set_commands(self):
+        """Telegram Menu button (bottom-left) - shows these commands."""
+        if self.sender is not None:
+            return
+        commands = [
+            {"command": "start", "description": "Welcome + balances"},
+            {"command": "getid", "description": "Your account ID"},
+            {"command": "packs", "description": "View all MLBB packs"},
+            {"command": "orders", "description": "List your orders"},
+            {"command": "balance", "description": "Per-region balances"},
+            {"command": "br", "description": "Quick order BR: /br uid zone diamonds"},
+            {"command": "ph", "description": "Quick order PH: /ph uid zone diamonds"},
+            {"command": "admin", "description": "Admin panel"},
+            {"command": "help", "description": "All commands"},
+        ]
+        try:
+            self.api("setMyCommands", {"commands": json.dumps(commands)})
+            print("[order-bot] menu commands set")
+        except Exception as e:
+            print("[order-bot] setMyCommands failed:", e)
+
     # -- menus -----------------------------------------------------------
     def main_menu(self):
         return _kb([
@@ -155,53 +233,77 @@ class OrderBot:
              {"text": "💎 Packs", "callback_data": "menu:packs"}],
             [{"text": "💰 Balance", "callback_data": "menu:balance"},
              {"text": "📦 My Orders", "callback_data": "menu:orders"}],
-            [{"text": "❓ Help", "callback_data": "menu:help"}],
+            [{"text": "🆔 My ID", "callback_data": "menu:getid"},
+             {"text": "❓ Help", "callback_data": "menu:help"}],
+        ])
+
+    def region_menu(self):
+        return _kb([
+            [{"text": "🇧🇷 Brazil (BR)", "callback_data": "region:BR"},
+             {"text": "🇵🇭 Philippines (PH)", "callback_data": "region:PH"}],
+            [{"text": "⬅️ Back to menu", "callback_data": "menu:main"}],
         ])
 
     def start(self, chat_id):
         self.sessions[chat_id] = {"step": "menu"}
-        return self.send(
-            chat_id,
-            "🎮 <b>MLBB Top-Up</b>\n\n"
-            "Pick a pack, send your MLBB ID + Zone ID, confirm, and pay "
-            "from your wallet.\n\n"
-            "Use the menu below, or /packs, /orders, /balance, /help.",
-            reply_markup=self.main_menu())
+        lines = ["👋 <b>Welcome!</b>\n",
+                 "<b>Your Current Balance</b>"]
+        lines.extend(self.balance_lines(chat_id))
+        lines.append(
+            "\n💎 <b>Diamond Topup Example</b>\n"
+            "For BR\n/br &lt;uid&gt; &lt;zone&gt; &lt;diamonds&gt;\n"
+            "For PH\n/ph &lt;uid&gt; &lt;zone&gt; &lt;diamonds&gt;\n"
+            "For Bulk (10 max)\n"
+            "/br &lt;uid&gt; &lt;zone&gt; &lt;diamonds&gt; "
+            "&lt;uid&gt; &lt;zone&gt; &lt;diamonds&gt; ...\n\n"
+            "Or tap Top Up below and pick a pack.")
+        return self.send(chat_id, "\n".join(lines),
+                         reply_markup=self.main_menu())
 
-    def show_packs(self, chat_id, page=0):
-        total_pages = max(1, (len(self.products) + PER_PAGE - 1) // PER_PAGE)
+    def show_packs(self, chat_id, region, page=0):
+        products = self.region_products(region)
+        total_pages = max(1, (len(products) + PER_PAGE - 1) // PER_PAGE)
         page = max(0, min(page, total_pages - 1))
-        self.sessions[chat_id] = {"step": "pack", "pack_page": page}
-        items = self.products[page * PER_PAGE:(page + 1) * PER_PAGE]
+        self.sessions[chat_id] = {"step": "pack", "region": region,
+                                  "pack_page": page}
+        items = products[page * PER_PAGE:(page + 1) * PER_PAGE]
         rows = []
         for i in range(0, len(items), 2):
             rows.append([{"text": f"{p['name']} - {p['price']}",
-                          "callback_data": f"pack:{p['pid']}"}
+                          "callback_data": f"pack:{region}:{p['pid']}"}
                          for p in items[i:i + 2]])
         nav = []
         if page > 0:
-            nav.append({"text": "◀️ Prev", "callback_data": f"packpage:{page - 1}"})
+            nav.append({"text": "◀️ Prev",
+                        "callback_data": f"packpage:{region}:{page - 1}"})
         if page < total_pages - 1:
-            nav.append({"text": "Next ▶️", "callback_data": f"packpage:{page + 1}"})
+            nav.append({"text": "Next ▶️",
+                        "callback_data": f"packpage:{region}:{page + 1}"})
         if nav:
             rows.append(nav)
-        rows.append([{"text": "⬅️ Back to menu", "callback_data": "menu:main"}])
-        return self.send(chat_id, f"Pick a pack: (page {page + 1}/{total_pages})",
+        rows.append([{"text": "⬅️ Regions", "callback_data": "menu:topup"},
+                     {"text": "⬅️ Menu", "callback_data": "menu:main"}])
+        return self.send(chat_id,
+                         f"Pick a pack ({REGIONS[region]['flag']} "
+                         f"{REGIONS[region]['name']}, "
+                         f"page {page + 1}/{total_pages}):",
                          reply_markup=_kb(rows))
 
     # -- order flow ------------------------------------------------------
     def send_confirm(self, chat_id, sess):
-        product = self.find_product(sess["pack"])
+        product = self.find_product(sess["pack"], sess["region"])
         sess["step"] = "confirm"
         kb = _kb([
             [{"text": "✅ Confirm & pay", "callback_data": "confirm:yes"},
              {"text": "❌ Cancel", "callback_data": "confirm:no"}]])
+        info = REGIONS[sess["region"]]
         return self.send(
             chat_id,
             "Please check carefully, then confirm:\n"
             f"<b>{product['name']}</b>\n"
+            f"Region: {info['flag']} {info['name']}\n"
             f"MLBB ID: {sess['uid']}\nZone ID: {sess['sid']}\n"
-            f"Price: {product['price']} {product.get('currency', 'BRL')}\n\n"
+            f"Price: {product['price']} {info['currency']}\n\n"
             "Make sure the ID and Zone are correct — diamonds go to "
             "exactly this account.",
             reply_markup=kb)
@@ -223,50 +325,62 @@ class OrderBot:
         self.notify_delivered(store.get_order(self.conn, order["game_order"]))
         return True
 
-    def pay_from_wallet(self, chat_id, sess):
-        """Charge the wallet, create the order, attempt delivery."""
-        product = self.find_product(sess["pack"])
-        price = float(product["price"])
-        currency = product.get("currency", "BRL")
-        bal = store.get_balance(self.conn, chat_id)
-        if bal["balance"] < price - 1e-9:
-            shortfall = price - bal["balance"]
+    def pay_batch(self, chat_id, sess):
+        """Charge the region wallet once for a batch (1..10 orders)."""
+        region = sess["region"]
+        info = REGIONS[region]
+        currency = info["currency"]
+        items = sess["batch"]  # [{product, uid, sid, price}]
+        total = sum(it["price"] for it in items)
+        bal = store.get_region_balance(self.conn, chat_id, region)
+        if bal["balance"] < total - 1e-9:
+            shortfall = total - bal["balance"]
             sess["step"] = "menu"
             return self.send(
                 chat_id,
                 f"⚠️ Not enough balance.\n"
-                f"Price: {price:.2f} {currency}\n"
-                f"Your balance: {bal['balance']:.2f}\n"
+                f"Total: {total:.2f} {currency}\n"
+                f"Your balance: {bal['balance']:.2f} {currency}\n"
                 f"You need {shortfall:.2f} more.\n\n"
-                f"Add funds with: /addfund {shortfall:.2f}\n"
-                "Then use /start again to place the order.\n"
+                f"Add funds with: /addfund {region.lower()} {shortfall:.2f}\n"
+                "Then place the order again.\n"
                 "(No order was created.)")
-        store.deduct_balance(self.conn, chat_id, price)
-        order_id = store.create_order(self.conn, chat_id, sess["uid"],
-                                      sess["sid"], sess["pack"],
-                                      product["price"], currency)
-        store.update_order(self.conn, order_id, "PAID", "WALLET")
-        order = store.get_order(self.conn, order_id)
-        new_bal = store.get_balance(self.conn, chat_id)
+        store.deduct_region_balance(self.conn, chat_id, region, total)
+        order_ids = []
+        delivered = 0
+        for it in items:
+            order_id = store.create_order(self.conn, chat_id, it["uid"],
+                                          it["sid"], it["product"]["pid"],
+                                          it["product"]["price"], currency)
+            store.update_order(self.conn, order_id, "PAID", "WALLET")
+            order = store.get_order(self.conn, order_id)
+            if self._attempt_delivery(order):
+                delivered += 1
+            order_ids.append(order_id)
+        new_bal = store.get_region_balance(self.conn, chat_id, region)
         sess["step"] = "done"
-        delivered = self._attempt_delivery(order)
-        if delivered:
-            return self.send(
-                chat_id,
-                f"✅ <b>Paid and delivered!</b>\n"
-                f"Order {order_id}\n{product['name']} for MLBB ID "
-                f"{sess['uid']} (Zone {sess['sid']})\n"
-                f"Paid: {price:.2f} {currency}\n"
-                f"Remaining balance: {new_bal['balance']:.2f}")
-        return self.send(
-            chat_id,
-            f"✅ <b>Payment received.</b>\n"
-            f"Order {order_id}\n{product['name']} for MLBB ID "
-            f"{sess['uid']} (Zone {sess['sid']})\n"
-            f"Paid: {price:.2f} {currency}\n"
-            f"Remaining balance: {new_bal['balance']:.2f}\n\n"
-            "Delivery will be completed by the merchant shortly — "
-            "you'll get a confirmation message here once it's delivered.")
+        lines = [f"✅ <b>Payment received.</b>",
+                 f"Orders: {', '.join(order_ids)}",
+                 f"Paid: {total:.2f} {currency}",
+                 f"Remaining balance: {new_bal['balance']:.2f} {currency}"]
+        if delivered == len(items):
+            lines.append("All orders delivered! 🎉")
+        elif delivered:
+            lines.append(f"{delivered}/{len(items)} delivered; the rest "
+                         "will be completed by the merchant shortly.")
+        else:
+            lines.append("Delivery will be completed by the merchant "
+                         "shortly — you'll get a confirmation message "
+                         "here once it's delivered.")
+        return self.send(chat_id, "\n".join(lines))
+
+    def pay_from_wallet(self, chat_id, sess):
+        """Single-order checkout, via the batch path (batch of 1)."""
+        product = self.find_product(sess["pack"], sess["region"])
+        sess["batch"] = [{"product": product, "uid": sess["uid"],
+                          "sid": sess["sid"],
+                          "price": float(product["price"])}]
+        return self.pay_batch(chat_id, sess)
 
     def notify_delivered(self, order):
         chat_id = order.get("telegram_chat_id")
@@ -281,16 +395,64 @@ class OrderBot:
         """Smile.one -> merchant, per the docs. Sign-verified inside
         merchant_app. On SUCCESS: PAID -> delivery attempt -> notify.
         Returns the docs status dict (200/201/204/205)."""
-        result = merchant_app.payment_notification(body)
-        if result.get("status") == 200 and result.get("game_status") == "SUCCESS":
-            order = store.get_order(self.conn, body.get("game_order", ""))
-            if order and order["status"] == "DELIVERED":
-                # MerchantApp already delivered + notified via on_delivered.
-                pass
-        return result
+        return merchant_app.payment_notification(body)
 
-    # -- admin (kept minimal: stats + pack prices, the two things the
-    # merchant actually uses; admin = ADMIN_CHAT_IDS only, no password) --
+    # -- quick orders (/br, /ph, bulk) ------------------------------------
+    def parse_quick_order(self, chat_id, region, args):
+        """Validate a quick-order command into a batch, or explain why
+        not. args = tokens after /br or /ph."""
+        info = REGIONS[region]
+        if not self.region_products(region):
+            return self.send(
+                chat_id,
+                f"{info['flag']} {info['name']} packs aren't available yet.\n"
+                "The official pack list for this region is still being "
+                "verified — no prices have been set, so no order can be "
+                "placed for this region right now.")
+        if not args or len(args) % 3 != 0:
+            return self.send(
+                chat_id,
+                f"Usage: /{region.lower()} &lt;uid&gt; &lt;zone&gt; "
+                "&lt;diamonds&gt; ...\n"
+                f"Example: /{region.lower()} 986305 2375 86\n"
+                f"Bulk: up to {BULK_MAX} orders in one command.")
+        triplets = [args[i:i + 3] for i in range(0, len(args), 3)]
+        if len(triplets) > BULK_MAX:
+            return self.send(
+                chat_id,
+                f"Bulk max is {BULK_MAX} orders per command — you sent "
+                f"{len(triplets)}. Split it into smaller commands.")
+        items = []
+        for uid, sid, diamonds in triplets:
+            if not (uid.isdigit() and sid.isdigit() and diamonds.isdigit()):
+                return self.send(
+                    chat_id,
+                    "UID, Zone and diamonds must all be numbers.\n"
+                    f"Bad entry: {uid} {sid} {diamonds}")
+            product = self.find_pack_by_diamonds(int(diamonds), region)
+            if not product:
+                return self.send(
+                    chat_id,
+                    f"No pack for {diamonds} diamonds in {region}. "
+                    "Use /packs to see the available packs.")
+            items.append({"product": product, "uid": uid, "sid": sid,
+                          "price": float(product["price"])})
+        total = sum(it["price"] for it in items)
+        sess = {"step": "batch_confirm", "region": region, "batch": items}
+        self.sessions[chat_id] = sess
+        lines = ["Please check carefully, then confirm:"]
+        for it in items:
+            lines.append(f"• {it['product']['name']} — ID {it['uid']} "
+                         f"(Zone {it['sid']}) — {it['price']:.2f} "
+                         f"{info['currency']}")
+        lines.append(f"\nTotal: {total:.2f} {info['currency']} "
+                     f"({len(items)} order{'s' if len(items) > 1 else ''})")
+        kb = _kb([
+            [{"text": "✅ Confirm & pay", "callback_data": "batch:yes"},
+             {"text": "❌ Cancel", "callback_data": "batch:no"}]])
+        return self.send(chat_id, "\n".join(lines), reply_markup=kb)
+
+    # -- admin (stats + pack prices; ADMIN_CHAT_IDS only, no password) --
     def admin_menu(self):
         return _kb([
             [{"text": "📊 Stats", "callback_data": "admin:stats"},
@@ -300,24 +462,41 @@ class OrderBot:
 
     def show_admin_menu(self, chat_id):
         stats = store.get_stats(self.conn)
+        totals = store.get_region_totals(self.conn)
+        wallet_lines = "\n".join(
+            f"Wallet {REGIONS[c]['flag']} [{c}]: {v:.2f} "
+            f"{REGIONS[c]['currency']}" for c, v in sorted(totals.items()))
         return self.send(chat_id,
                          "🛠 <b>Admin Panel</b>\n\n"
                          f"Users: {stats['users']}\n"
                          f"Orders: {stats['orders']} ({stats['delivered']} delivered)\n"
-                         f"Pending funds: {stats['pending_funds']}\n"
-                         f"Total wallet balance: {stats['total_balance']:.2f}\n"
+                         + (wallet_lines + "\n" if wallet_lines else "") +
                          f"Total funded: {stats['total_funded']:.2f}\n"
                          f"Total spent: {stats['total_spent']:.2f}",
                          reply_markup=self.admin_menu())
 
-    def show_admin_packs(self, chat_id):
-        rows = []
-        for i in range(0, len(self.products), 2):
-            rows.append([{"text": f"{p['name']} - {p['price']}",
-                          "callback_data": f"admin:pack:{p['pid']}"}
-                         for p in self.products[i:i + 2]])
+    def show_admin_regions(self, chat_id):
+        rows = [[{"text": f"{REGIONS[c]['flag']} {REGIONS[c]['name']}",
+                  "callback_data": f"admin:packlist:{c}"}
+                 for c in ("BR", "PH")]]
         rows.append([{"text": "⬅️ Admin menu", "callback_data": "admin:menu"}])
-        return self.send(chat_id, "💎 Set pack prices — tap a pack:",
+        return self.send(chat_id, "💎 Set pack prices — pick a region:",
+                         reply_markup=_kb(rows))
+
+    def show_admin_packs(self, chat_id, region):
+        products = self.region_products(region)
+        if not products:
+            return self.send(chat_id,
+                             f"No packs configured for {region} yet.")
+        rows = []
+        for i in range(0, len(products), 2):
+            rows.append([{"text": f"{p['name']} - {p['price']}",
+                          "callback_data": f"admin:pack:{region}:{p['pid']}"}
+                         for p in products[i:i + 2]])
+        rows.append([{"text": "⬅️ Regions", "callback_data": "admin:packs"},
+                     {"text": "⬅️ Admin menu", "callback_data": "admin:menu"}])
+        return self.send(chat_id,
+                         f"💎 Set pack prices ({region}) — tap a pack:",
                          reply_markup=_kb(rows))
 
     def handle_admin_callback(self, chat_id, data):
@@ -325,44 +504,67 @@ class OrderBot:
             return self.show_admin_menu(chat_id)
         if data == "admin:stats":
             stats = store.get_stats(self.conn)
+            totals = store.get_region_totals(self.conn)
+            wallet_lines = "\n".join(
+                f"Wallet {REGIONS[c]['flag']} [{c}]: {v:.2f} "
+                f"{REGIONS[c]['currency']}" for c, v in sorted(totals.items()))
             self.send(chat_id,
                       f"📊 <b>Stats</b>\nUsers: {stats['users']}\n"
                       f"Orders: {stats['orders']} "
-                      f"({stats['delivered']} delivered)\n"
-                      f"Total balance: {stats['total_balance']:.2f}\n"
-                      f"Total funded: {stats['total_funded']:.2f}\n"
-                      f"Total spent: {stats['total_spent']:.2f}")
+                      f"({stats['delivered']} delivered)\n" + wallet_lines)
             return self.send(chat_id, "Back to admin:",
                              reply_markup=self.admin_menu())
         if data == "admin:packs":
-            return self.show_admin_packs(chat_id)
+            return self.show_admin_regions(chat_id)
+        if data.startswith("admin:packlist:"):
+            return self.show_admin_packs(chat_id, data.split(":", 2)[2])
         if data.startswith("admin:pack:"):
-            product = self.find_product(data.split(":", 2)[2])
+            _, _, region, pid = data.split(":", 3)
+            product = self.find_product(pid, region)
             if not product:
                 return self.send(chat_id, "Pack not found.")
             kb = _kb([
                 [{"text": "✏️ Set new price",
-                  "callback_data": f"admin:setprice:{product['pid']}"}],
-                [{"text": "⬅️ Packs", "callback_data": "admin:packs"},
+                  "callback_data": f"admin:setprice:{region}:{pid}"}],
+                [{"text": "⬅️ Packs",
+                  "callback_data": f"admin:packlist:{region}"},
                  {"text": "⬅️ Admin menu", "callback_data": "admin:menu"}],
             ])
             return self.send(chat_id,
                              f"💎 {product['name']}\n"
                              f"Current price: {product['price']} "
-                             f"{product.get('currency', 'BRL')}",
+                             f"{REGIONS[region]['currency']}",
                              reply_markup=kb)
         if data.startswith("admin:setprice:"):
-            product = self.find_product(data.split(":", 2)[2])
+            _, _, region, pid = data.split(":", 3)
+            product = self.find_product(pid, region)
             if not product:
                 return self.send(chat_id, "Pack not found.")
             self.sessions[chat_id] = {"step": "admin_set_price",
-                                      "admin_price_pid": product["pid"]}
+                                      "admin_price_region": region,
+                                      "admin_price_pid": pid}
             return self.send(chat_id,
                              f"Send the new price for {product['name']} "
-                             "(e.g. 6.50).")
+                             f"in {REGIONS[region]['currency']} (e.g. 6.50).")
         return None
 
     # -- commands / messages ----------------------------------------------
+    def help_text(self):
+        return (
+            "🤖 <b>All Commands</b>\n\n"
+            "/start — Welcome + your balances + order examples\n"
+            "/getid — Your account ID\n"
+            "/packs — List all packs and prices\n"
+            "/orders — List your orders\n"
+            "/balance — Your per-region balances\n"
+            "/br &lt;uid&gt; &lt;zone&gt; &lt;diamonds&gt; — Quick order, Brazil\n"
+            "/ph &lt;uid&gt; &lt;zone&gt; &lt;diamonds&gt; — Quick order, Philippines\n"
+            "Bulk: repeat uid + zone + diamonds, up to 10 orders in one "
+            "command, e.g. /br 986305 2375 86 986305 2375 86\n"
+            "/addfund [region] &lt;amount&gt; — Add funds (test mode)\n"
+            "/admin — Admin panel\n"
+            "/help — This list")
+
     def handle_message(self, chat_id, text):
         sess = self.sessions.get(chat_id)
         text = (text or "").strip()
@@ -374,8 +576,9 @@ class OrderBot:
             if not self.is_admin(chat_id):
                 self.sessions.pop(chat_id, None)
                 return self.send(chat_id, "Admin access only.")
+            region = sess.get("admin_price_region", "BR")
             pid = sess.get("admin_price_pid")
-            product = self.find_product(pid) if pid else None
+            product = self.find_product(pid, region) if pid else None
             try:
                 value = float(text.replace(",", "."))
             except ValueError:
@@ -385,8 +588,7 @@ class OrderBot:
                                  "Send a valid price above 0, e.g. 6.50.")
             old = product["price"]
             product["price"] = f"{value:.2f}"
-            saved = self.merchant.save_products() if self.merchant else False
-            if saved:
+            if self._save_region(region):
                 self.sessions.pop(chat_id, None)
                 return self.send(chat_id,
                                  f"✅ {product['name']} price updated: "
@@ -396,30 +598,45 @@ class OrderBot:
                              "Could not save the new price — nothing changed.")
         if text.startswith("/start"):
             return self.start(chat_id)
+        if text.startswith("/getid"):
+            return self.send(chat_id,
+                             f"🆔 <b>Your Account ID:</b> {chat_id}\n"
+                             "This is your Telegram ID for this bot.")
+        if text.startswith("/help"):
+            return self.send(chat_id, self.help_text())
         if text.startswith("/packs"):
-            self.send(chat_id, self.packs_text())
+            self.send(chat_id, self.packs_text("BR"))
+            if self.region_products("PH"):
+                self.send(chat_id, self.packs_text("PH"))
             return self.send(chat_id, "Want to buy one? Tap Top Up below:",
                              reply_markup=self.main_menu())
         if text.startswith("/orders"):
             orders = store.list_orders(self.conn, chat_id)
             if not orders:
                 return self.send(chat_id, "No orders yet. Use /start to top up.")
-            lines = [f"{o['game_order']} - {o['productid']} - {o['status']}"
-                     for o in orders]
+            lines = []
+            for o in orders:
+                region = CURRENCY_REGION.get(o["currency"], o["currency"])
+                lines.append(f"{o['game_order']} - {o['productid']} "
+                             f"[{region}] - {o['status']}")
             return self.send(chat_id, "Your orders:\n" + "\n".join(lines))
         if text.startswith("/balance"):
-            bal = store.get_balance(self.conn, chat_id)
-            return self.send(chat_id,
-                             f"💰 <b>Your balance: {bal['balance']:.2f}</b>\n"
-                             f"Total added: {bal['total_funded']:.2f}\n"
-                             f"Total spent: {bal['total_spent']:.2f}")
+            lines = ["💰 <b>Your Current Balance</b>"]
+            lines.extend(self.balance_lines(chat_id))
+            return self.send(chat_id, "\n".join(lines))
         if text.startswith("/addfund"):
             parts = text.split()
-            if len(parts) < 2:
+            region, amount_s = "BR", None
+            if len(parts) == 2:
+                amount_s = parts[1]
+            elif len(parts) == 3 and parts[1].upper() in REGIONS:
+                region, amount_s = parts[1].upper(), parts[2]
+            if amount_s is None:
                 return self.send(chat_id,
-                                 "Usage: /addfund <amount>\nExample: /addfund 100")
+                                 "Usage: /addfund [region] <amount>\n"
+                                 "Examples: /addfund 100, /addfund br 100")
             try:
-                amount = float(parts[1])
+                amount = float(amount_s)
                 if amount <= 0:
                     raise ValueError
             except ValueError:
@@ -429,21 +646,18 @@ class OrderBot:
                 return self.send(chat_id,
                                  "Test auto-credit is off. Ask the merchant "
                                  "to add funds to your wallet.")
-            bal = store.credit_balance(self.conn, chat_id, amount)
+            bal = store.credit_region_balance(self.conn, chat_id, region,
+                                              amount)
             return self.send(chat_id,
-                             f"✅ <b>Test mode:</b> {amount:.2f} added instantly.\n"
-                             f"New balance: {bal['balance']:.2f}")
-        if text.startswith("/help"):
-            return self.send(chat_id,
-                             "How ordering works:\n"
-                             "1. /start, tap Top Up, pick a pack\n"
-                             "2. Send your MLBB ID, then your Zone ID\n"
-                             "3. Check the confirm screen and pay from "
-                             "your wallet\n"
-                             "4. Delivery follows — you get a message here "
-                             "when it's delivered\n\n"
-                             "/packs - list packs\n/orders - your orders\n"
-                             "/balance - your wallet\n/addfund - test credit")
+                             f"✅ <b>Test mode:</b> {amount:.2f} "
+                             f"{REGIONS[region]['currency']} added instantly "
+                             f"to your {region} wallet.\n"
+                             f"New {region} balance: {bal['balance']:.2f}")
+        m = re.match(r"^/(br|ph)(?:\s+(.*))?$", text.lower())
+        if m:
+            region = m.group(1).upper()
+            args = m.group(2).split() if m.group(2) else []
+            return self.parse_quick_order(chat_id, region, args)
         if not sess:
             return self.start(chat_id)
         if sess["step"] == "uid":
@@ -472,21 +686,36 @@ class OrderBot:
         if data == "menu:main":
             return self.start(chat_id)
         if data == "menu:topup":
-            return self.show_packs(chat_id, 0)
+            self.sessions[chat_id] = {"step": "region"}
+            return self.send(chat_id, "Pick a region:",
+                             reply_markup=self.region_menu())
+        if data.startswith("region:"):
+            region = data.split(":", 1)[1]
+            if region not in REGIONS:
+                return self.send(chat_id, "Unknown region.")
+            if not self.region_products(region):
+                return self.send(chat_id,
+                                 f"{REGIONS[region]['flag']} "
+                                 f"{REGIONS[region]['name']} packs aren't "
+                                 "available yet.")
+            return self.show_packs(chat_id, region, 0)
         if data == "menu:packs":
-            self.send(chat_id, self.packs_text())
+            self.send(chat_id, self.packs_text("BR"))
+            if self.region_products("PH"):
+                self.send(chat_id, self.packs_text("PH"))
             return self.send(chat_id, "Back to menu:",
                              reply_markup=self.main_menu())
         if data.startswith("packpage:"):
             try:
-                page = int(data.split(":", 1)[1])
+                _, region, page = data.split(":", 2)
+                page = int(page)
             except ValueError:
-                page = 0
-            return self.show_packs(chat_id, page)
+                region, page = "BR", 0
+            return self.show_packs(chat_id, region, page)
         if data == "menu:balance":
-            bal = store.get_balance(self.conn, chat_id)
-            self.send(chat_id,
-                      f"💰 <b>Your balance: {bal['balance']:.2f}</b>")
+            lines = ["💰 <b>Your Current Balance</b>"]
+            lines.extend(self.balance_lines(chat_id))
+            self.send(chat_id, "\n".join(lines))
             return self.send(chat_id, "Back to menu:",
                              reply_markup=self.main_menu())
         if data == "menu:orders":
@@ -494,22 +723,34 @@ class OrderBot:
             if not orders:
                 self.send(chat_id, "No orders yet. Use Top Up from the menu.")
             else:
-                lines = [f"{o['game_order']} - {o['productid']} - {o['status']}"
-                         for o in orders]
+                lines = []
+                for o in orders:
+                    region = CURRENCY_REGION.get(o["currency"], o["currency"])
+                    lines.append(f"{o['game_order']} - {o['productid']} "
+                                 f"[{region}] - {o['status']}")
                 self.send(chat_id, "Your orders:\n" + "\n".join(lines))
             return self.send(chat_id, "Back to menu:",
                              reply_markup=self.main_menu())
+        if data == "menu:getid":
+            return self.send(chat_id,
+                             f"🆔 <b>Your Account ID:</b> {chat_id}")
         if data == "menu:help":
             return self.handle_message(chat_id, "/help")
         if data.startswith("pack:"):
-            product = self.find_product(data.split(":", 1)[1])
+            parts = data.split(":")
+            if len(parts) == 3:
+                _, region, pid = parts
+            else:
+                region, pid = "BR", parts[1]
+            product = self.find_product(pid, region)
             if not product:
                 return self.send(chat_id, "Pack not found. Pick another:")
             sess["pack"] = product["pid"]
+            sess["region"] = region
             sess["step"] = "uid"
             return self.send(chat_id,
                              f"Pack: {product['name']} - {product['price']} "
-                             f"{product.get('currency', 'BRL')}.\n"
+                             f"{REGIONS[region]['currency']}.\n"
                              "Send your MLBB ID (numbers only).")
         if data == "confirm:yes":
             if not sess.get("pack") or not sess.get("uid") or not sess.get("sid"):
@@ -517,6 +758,14 @@ class OrderBot:
                 return self.start(chat_id)
             return self.pay_from_wallet(chat_id, sess)
         if data == "confirm:no":
+            self.sessions.pop(chat_id, None)
+            return self.start(chat_id)
+        if data == "batch:yes":
+            if not sess.get("batch") or not sess.get("region"):
+                self.sessions.pop(chat_id, None)
+                return self.start(chat_id)
+            return self.pay_batch(chat_id, sess)
+        if data == "batch:no":
             self.sessions.pop(chat_id, None)
             return self.start(chat_id)
         return None
@@ -536,24 +785,6 @@ class OrderBot:
                              {"callback_query_id": cb["id"]})
                 except Exception:
                     pass
-
-    def set_commands(self):
-        """Telegram Menu button (bottom-left) - shows these commands."""
-        if self.sender is not None:
-            return
-        commands = [
-            {"command": "start", "description": "Open the main menu"},
-            {"command": "packs", "description": "View all MLBB packs"},
-            {"command": "orders", "description": "List your orders"},
-            {"command": "balance", "description": "Check your balance"},
-            {"command": "admin", "description": "Admin panel"},
-            {"command": "help", "description": "How ordering works"},
-        ]
-        try:
-            self.api("setMyCommands", {"commands": json.dumps(commands)})
-            print("[order-bot] menu commands set")
-        except Exception as e:
-            print("[order-bot] setMyCommands failed:", e)
 
     def poll_once(self):
         res = self.api("getUpdates", {"offset": self.offset, "timeout": 20})

@@ -37,6 +37,16 @@ def init_db(path: str) -> sqlite3.Connection:
             created_at INTEGER
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS region_balances (
+            telegram_chat_id INTEGER,
+            region TEXT,
+            balance REAL DEFAULT 0,
+            total_funded REAL DEFAULT 0,
+            total_spent REAL DEFAULT 0,
+            PRIMARY KEY (telegram_chat_id, region)
+        )"""
+    )
     conn.commit()
     return conn
 
@@ -208,3 +218,74 @@ def load_json(path, default):
             return json.load(f)
     except Exception:
         return default
+
+
+# -- per-region wallets --------------------------------------------------
+# One wallet per region (BR, PH, ...). The old single users.balance is
+# carried into BR exactly once, on first access, so existing test
+# credits are not lost when regions land.
+
+def _ensure_region_row(conn, chat_id, region):
+    row = conn.execute(
+        "SELECT balance FROM region_balances "
+        "WHERE telegram_chat_id=? AND region=?", (chat_id, region)).fetchone()
+    if row:
+        return
+    seed_bal, seed_funded, seed_spent = 0, 0, 0
+    if region == "BR":
+        legacy = get_balance(conn, chat_id)
+        seed_bal, seed_funded, seed_spent = (
+            legacy["balance"], legacy["total_funded"], legacy["total_spent"])
+    with _lock:
+        conn.execute(
+            "INSERT OR IGNORE INTO region_balances VALUES (?,?,?,?,?)",
+            (chat_id, region, seed_bal, seed_funded, seed_spent))
+        conn.commit()
+
+
+def get_region_balance(conn, chat_id, region):
+    _ensure_region_row(conn, chat_id, region)
+    row = conn.execute(
+        "SELECT balance, total_funded, total_spent FROM region_balances "
+        "WHERE telegram_chat_id=? AND region=?", (chat_id, region)).fetchone()
+    return {"balance": row[0], "total_funded": row[1], "total_spent": row[2]}
+
+
+def credit_region_balance(conn, chat_id, region, amount):
+    _ensure_region_row(conn, chat_id, region)
+    with _lock:
+        conn.execute(
+            "UPDATE region_balances SET balance=balance+?, "
+            "total_funded=total_funded+? "
+            "WHERE telegram_chat_id=? AND region=?",
+            (amount, amount, chat_id, region))
+        conn.commit()
+    return get_region_balance(conn, chat_id, region)
+
+
+def deduct_region_balance(conn, chat_id, region, amount):
+    bal = get_region_balance(conn, chat_id, region)
+    if bal["balance"] < amount - 1e-9:
+        return None
+    with _lock:
+        conn.execute(
+            "UPDATE region_balances SET balance=balance-?, "
+            "total_spent=total_spent+? "
+            "WHERE telegram_chat_id=? AND region=?",
+            (amount, amount, chat_id, region))
+        conn.commit()
+    return get_region_balance(conn, chat_id, region)
+
+
+def list_region_balances(conn, chat_id):
+    rows = conn.execute(
+        "SELECT region, balance FROM region_balances "
+        "WHERE telegram_chat_id=? ORDER BY region", (chat_id,)).fetchall()
+    return [{"region": r[0], "balance": r[1]} for r in rows]
+
+
+def get_region_totals(conn):
+    rows = conn.execute(
+        "SELECT region, SUM(balance) FROM region_balances "
+        "GROUP BY region").fetchall()
+    return {r[0]: r[1] for r in rows}

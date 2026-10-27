@@ -63,10 +63,11 @@ class OrderBotTest(unittest.TestCase):
         orders = store.list_orders(self.conn, 111)
         self.assertEqual(len(orders), 1)
         self.assertEqual(orders[0]["status"], "DELIVERED")
-        self.assertAlmostEqual(store.get_balance(self.conn, 111)["balance"],
+        self.assertAlmostEqual(store.get_region_balance(self.conn, 111, "BR")["balance"],
                                93.75)
         joined = "\n".join(self.sender.texts())
-        self.assertIn("Paid and delivered", joined)
+        self.assertIn("Payment received", joined)
+        self.assertIn("All orders delivered!", joined)
         self.assertIn("Delivered!", joined)
         self.assertIn(orders[0]["game_order"], joined)
 
@@ -78,7 +79,7 @@ class OrderBotTest(unittest.TestCase):
         orders = store.list_orders(self.conn, 111)
         self.assertEqual(len(orders), 1)
         self.assertEqual(orders[0]["status"], "PAID")
-        self.assertAlmostEqual(store.get_balance(self.conn, 111)["balance"],
+        self.assertAlmostEqual(store.get_region_balance(self.conn, 111, "BR")["balance"],
                                93.75)
         joined = "\n".join(self.sender.texts())
         self.assertIn("Payment received", joined)
@@ -229,10 +230,12 @@ class OrderBotTest(unittest.TestCase):
         bot.handle_message(111, "/admin")
         self.assertIn("Admin Panel", self.sender.texts()[-1])
         bot.handle_callback(111, "admin:packs")
+        self.assertIn("pick a region", self.sender.texts()[-1])
+        bot.handle_callback(111, "admin:packlist:BR")
         self.assertIn("Set pack prices", self.sender.texts()[-1])
-        bot.handle_callback(111, "admin:pack:5")
+        bot.handle_callback(111, "admin:pack:BR:5")
         self.assertIn("Current price: 6.25", self.sender.texts()[-1])
-        bot.handle_callback(111, "admin:setprice:5")
+        bot.handle_callback(111, "admin:setprice:BR:5")
         bot.handle_message(111, "abc")
         self.assertIn("valid price", self.sender.texts()[-1])
         bot.handle_message(111, "7.00")
@@ -242,6 +245,95 @@ class OrderBotTest(unittest.TestCase):
         doc = store.load_json(merchant.config["products_path"], {})
         saved = [p for p in doc["products"] if p["pid"] == "5"][0]
         self.assertEqual(saved["price"], "7.00")
+
+    # -- multi-region: /start, /getid, /br, /ph, bulk --------------------
+    def test_start_shows_balances_and_examples(self):
+        bot = self.make_bot()
+        bot.handle_message(111, "/start")
+        joined = "\n".join(self.sender.texts())
+        self.assertIn("Your Current Balance", joined)
+        self.assertIn("[BR]", joined)
+        self.assertIn("[PH]", joined)
+        self.assertIn("/br", joined)
+        self.assertIn("/ph", joined)
+        self.assertIn("Bulk (10 max)", joined)
+
+    def test_getid(self):
+        bot = self.make_bot()
+        bot.handle_message(111, "/getid")
+        self.assertIn("111", self.sender.texts()[-1])
+        self.assertIn("Account ID", self.sender.texts()[-1])
+
+    def test_quick_order_br_single(self):
+        bot = self.make_bot(deliver=lambda o: True)
+        bot.handle_message(111, "/addfund 100")
+        bot.handle_message(111, "/br 603803877 5674 86")
+        confirm = self.sender.texts()[-1]
+        self.assertIn("603803877", confirm)
+        self.assertIn("Total: 6.25 BRL", confirm)
+        bot.handle_callback(111, "batch:yes")
+        orders = store.list_orders(self.conn, 111)
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0]["status"], "DELIVERED")
+        self.assertAlmostEqual(
+            store.get_region_balance(self.conn, 111, "BR")["balance"], 93.75)
+
+    def test_quick_order_bulk_two_and_max(self):
+        bot = self.make_bot(deliver=lambda o: True)
+        bot.handle_message(111, "/addfund 100")
+        bot.handle_message(111, "/br 111 1 86 222 2 55")
+        bot.handle_callback(111, "batch:yes")
+        orders = store.list_orders(self.conn, 111)
+        self.assertEqual(len(orders), 2)
+        self.assertAlmostEqual(
+            store.get_region_balance(self.conn, 111, "BR")["balance"],
+            100 - 6.25 - 4.00)
+        # 11 triplets exceeds the bulk max.
+        bot2 = self.make_bot()
+        args = " ".join(["111 1 86"] * 11)
+        bot2.handle_message(222, f"/br {args}")
+        self.assertIn("Bulk max is 10", self.sender.texts()[-1])
+        self.assertEqual(store.list_orders(self.conn, 222), [])
+
+    def test_quick_order_invalid_and_unknown_pack(self):
+        bot = self.make_bot()
+        bot.handle_message(111, "/br 111 1")
+        self.assertIn("Usage:", self.sender.texts()[-1])
+        bot.handle_message(111, "/br abc 1 86")
+        self.assertIn("must all be numbers", self.sender.texts()[-1])
+        bot.handle_message(111, "/br 111 1 999")
+        self.assertIn("No pack for 999 diamonds", self.sender.texts()[-1])
+        self.assertEqual(store.list_orders(self.conn, 111), [])
+
+    def test_ph_gated_without_verified_packs(self):
+        bot = self.make_bot()
+        bot.handle_message(111, "/ph 111 1 11")
+        self.assertIn("aren't available yet", self.sender.texts()[-1])
+        bot.handle_callback(111, "region:PH")
+        self.assertIn("aren't available yet", self.sender.texts()[-1])
+        self.assertEqual(store.list_orders(self.conn, 111), [])
+
+    def test_region_balance_carryover_from_legacy_wallet(self):
+        store.credit_balance(self.conn, 111, 50.0)  # old single wallet
+        bot = self.make_bot()
+        bal = store.get_region_balance(self.conn, 111, "BR")
+        self.assertAlmostEqual(bal["balance"], 50.0)
+        ph = store.get_region_balance(self.conn, 111, "PH")
+        self.assertAlmostEqual(ph["balance"], 0.0)
+        bot.handle_message(111, "/balance")
+        joined = "\n".join(self.sender.texts())
+        self.assertIn("50.00 BRL", joined)
+        self.assertIn("0.00 PHP", joined)
+
+    def test_menu_region_pick(self):
+        bot = self.make_bot()
+        bot.handle_message(111, "/start")
+        bot.handle_callback(111, "menu:topup")
+        self.assertIn("Pick a region", self.sender.texts()[-1])
+        bot.handle_callback(111, "region:BR")
+        self.assertIn("Pick a pack", self.sender.texts()[-1])
+        bot.handle_callback(111, "pack:BR:5")
+        self.assertIn("Send your MLBB ID", self.sender.texts()[-1])
 
 
 if __name__ == "__main__":

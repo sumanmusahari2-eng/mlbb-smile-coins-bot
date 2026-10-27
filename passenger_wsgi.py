@@ -55,6 +55,30 @@ def _load_env(path):
 
 _load_env(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
+def _load_ph_products(base):
+    try:
+        with open(os.path.join(base, "products_ph.json"),
+                  encoding="utf-8") as f:
+            return json.load(f).get("products", [])
+    except Exception:
+        return []
+
+
+def _save_ph_products(base, products):
+    path = os.path.join(base, "products_ph.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except Exception:
+        doc = {}
+    doc["products"] = products
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+    return True
+
+
 _base = os.path.dirname(os.path.abspath(__file__))
 _config = {
     "merchant_key": os.environ.get("SMILEONE_MERCHANT_KEY", "1234567890"),
@@ -70,10 +94,16 @@ _merchant = OrderMerchantApp(_conn, _config, deliver=None, on_delivered=None)
 _token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 _bot = None
 if _token:
+    _ph_products = _load_ph_products(_base)
     _bot = OrderBot(_token, _conn, _merchant.products, deliver=None,
                     auto_credit_test=_config["fund_auto_credit_test"] == "true",
                     admin_chat_ids=_config["admin_chat_ids"],
-                    merchant=_merchant)
+                    merchant=_merchant,
+                    regions_products={"BR": _merchant.products,
+                                      "PH": _ph_products},
+                    save_region=lambda region: (
+                        _save_ph_products(_base, _ph_products)
+                        if region == "PH" else False))
 if _bot:
     _merchant.on_delivered = _bot.notify_delivered
 _secret = os.environ.get("WEBHOOK_SECRET", "")
