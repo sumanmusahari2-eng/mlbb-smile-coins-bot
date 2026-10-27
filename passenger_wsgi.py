@@ -106,6 +106,13 @@ if _token:
                         if region == "PH" else False))
 if _bot:
     _merchant.on_delivered = _bot.notify_delivered
+    # Update Telegram's menu on startup: without this, the menu keeps
+    # showing the previous bot version's commands (including /admin)
+    # forever, because nothing else ever calls setMyCommands.
+    try:
+        _bot.set_commands()
+    except Exception as e:
+        print(f"[passenger] set_commands failed: {e}")
 _secret = os.environ.get("WEBHOOK_SECRET", "")
 
 _routes = {

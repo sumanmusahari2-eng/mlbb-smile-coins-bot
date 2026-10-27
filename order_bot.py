@@ -206,10 +206,17 @@ class OrderBot:
                     print("[telegram] send failed:", e)
 
     def set_commands(self):
-        """Telegram Menu button (bottom-left) - shows these commands."""
+        """Telegram Menu button (bottom-left) - shows these commands.
+
+        Telegram shows ONE command list to everyone by default, so the
+        admin command must NOT be in the default list — otherwise every
+        user sees "Admin panel" in their menu (the panel itself stays
+        gated: non-admins get "Admin access only"). Admins get their
+        own per-chat menu (BotCommandScopeChat) that includes /admin.
+        """
         if self.sender is not None:
             return
-        commands = [
+        default = [
             {"command": "start", "description": "Welcome + balances"},
             {"command": "getid", "description": "Your account ID"},
             {"command": "packs", "description": "View all MLBB packs"},
@@ -217,14 +224,24 @@ class OrderBot:
             {"command": "balance", "description": "Per-region balances"},
             {"command": "br", "description": "Quick order BR: /br uid zone diamonds"},
             {"command": "ph", "description": "Quick order PH: /ph uid zone diamonds"},
-            {"command": "admin", "description": "Admin panel"},
             {"command": "help", "description": "All commands"},
         ]
         try:
-            self.api("setMyCommands", {"commands": json.dumps(commands)})
+            self.api("setMyCommands", {"commands": json.dumps(default)})
             print("[order-bot] menu commands set")
         except Exception as e:
             print("[order-bot] setMyCommands failed:", e)
+        scoped = default + [{"command": "admin",
+                             "description": "Admin panel"}]
+        for admin_id in sorted(self.admin_ids):
+            try:
+                self.api("setMyCommands", {
+                    "commands": json.dumps(scoped),
+                    "scope": json.dumps({"type": "chat",
+                                         "chat_id": admin_id})})
+                print(f"[order-bot] admin menu set for {admin_id}")
+            except Exception as e:
+                print(f"[order-bot] admin menu failed for {admin_id}: {e}")
 
     # -- menus -----------------------------------------------------------
     def main_menu(self):

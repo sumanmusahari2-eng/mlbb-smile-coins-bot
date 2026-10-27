@@ -335,6 +335,35 @@ class OrderBotTest(unittest.TestCase):
         bot.handle_callback(111, "pack:BR:5")
         self.assertIn("Send your MLBB ID", self.sender.texts()[-1])
 
+    # -- menu commands: /admin must not appear for everyone -------------
+    def test_menu_commands_admin_scoped(self):
+        bot = OrderBot("TESTTOKEN", self.conn, PACKS, sender=None,
+                       admin_chat_ids="111")
+        calls = []
+        bot.api = lambda m, p: calls.append((m, p)) or {"ok": True}
+        bot.set_commands()
+        self.assertEqual(len(calls), 2)
+        default_cmds = [c["command"] for c in json.loads(calls[0][1]["commands"])]
+        self.assertNotIn("admin", default_cmds)
+        self.assertIn("getid", default_cmds)
+        self.assertIn("br", default_cmds)
+        self.assertEqual(calls[0][1].get("scope"), None)
+        scoped = calls[1][1]
+        scoped_cmds = [c["command"] for c in json.loads(scoped["commands"])]
+        self.assertIn("admin", scoped_cmds)
+        self.assertEqual(json.loads(scoped["scope"]),
+                         {"type": "chat", "chat_id": 111})
+
+    def test_menu_commands_no_admin_without_admins(self):
+        bot = OrderBot("TESTTOKEN", self.conn, PACKS, sender=None,
+                       admin_chat_ids="")
+        calls = []
+        bot.api = lambda m, p: calls.append((m, p)) or {"ok": True}
+        bot.set_commands()
+        self.assertEqual(len(calls), 1)
+        cmds = [c["command"] for c in json.loads(calls[0][1]["commands"])]
+        self.assertNotIn("admin", cmds)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
