@@ -1,0 +1,21 @@
+name = "mlbb-smile-bot"
+main = "src/index.js"
+compatibility_date = "2026-10-27"
+
+# D1 database: create once with `wrangler d1 create mlbb-smile-bot-db`,
+# then paste the returned database_id below.
+[[d1_databases]]
+binding = "DB"
+database_name = "mlbb-smile-bot-db"
+database_id = "PASTE-DATABASE-ID-HERE"
+
+[vars]
+# Non-secret settings. Secrets (below) are set with `wrangler secret put`.
+FUND_AUTO_CREDIT_TEST = "true"
+
+# Secrets to set before first use (values never committed):
+#   wrangler secret put TELEGRAM_BOT_TOKEN
+#   wrangler secret put SMILEONE_MERCHANT_KEY
+#   wrangler secret put ADMIN_CHAT_IDS        (comma-separated Telegram IDs)
+#   wrangler secret put WEBHOOK_SECRET        (Telegram secret_token header)
+#   wrangler secret put SETUP_SECRET          (guards the /setup route)
