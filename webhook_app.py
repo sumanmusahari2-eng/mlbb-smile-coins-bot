@@ -9,8 +9,7 @@ Usage:
 import os
 
 import store
-from merchant_server import MerchantApp
-from telegram_bot import Bot
+from order_bot import OrderBot, OrderMerchantApp
 from webhook_server import serve_webhook
 from app import load_env
 
@@ -28,9 +27,14 @@ def main():
         "fund_auto_credit_test": os.environ.get("FUND_AUTO_CREDIT_TEST", "true"),
     }
     conn = store.init_db(os.environ.get("DB_PATH", os.path.join(base, "orders.db")))
-    merchant = MerchantApp(conn, config, on_delivered=None)
+    merchant = OrderMerchantApp(conn, config, deliver=None, on_delivered=None)
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    bot = Bot(token, conn, config, merchant) if token else None
+    bot = None
+    if token:
+        bot = OrderBot(token, conn, merchant.products, deliver=None,
+                       auto_credit_test=config["fund_auto_credit_test"] == "true",
+                       admin_chat_ids=config["admin_chat_ids"],
+                       merchant=merchant)
     if bot:
         merchant.on_delivered = bot.notify_delivered
         bot.set_commands()

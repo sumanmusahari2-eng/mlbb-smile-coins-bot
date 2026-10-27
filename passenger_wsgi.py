@@ -41,8 +41,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import store
-from merchant_server import MerchantApp
-from telegram_bot import Bot
+from order_bot import OrderBot, OrderMerchantApp
 
 
 def _load_env(path):
@@ -67,9 +66,14 @@ _config = {
     "fund_auto_credit_test": os.environ.get("FUND_AUTO_CREDIT_TEST", "true"),
 }
 _conn = store.init_db(os.environ.get("DB_PATH", os.path.join(_base, "orders.db")))
-_merchant = MerchantApp(_conn, _config, on_delivered=None)
+_merchant = OrderMerchantApp(_conn, _config, deliver=None, on_delivered=None)
 _token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-_bot = Bot(_token, _conn, _config, _merchant) if _token else None
+_bot = None
+if _token:
+    _bot = OrderBot(_token, _conn, _merchant.products, deliver=None,
+                    auto_credit_test=_config["fund_auto_credit_test"] == "true",
+                    admin_chat_ids=_config["admin_chat_ids"],
+                    merchant=_merchant)
 if _bot:
     _merchant.on_delivered = _bot.notify_delivered
 _secret = os.environ.get("WEBHOOK_SECRET", "")
