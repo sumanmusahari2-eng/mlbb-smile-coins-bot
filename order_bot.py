@@ -181,10 +181,10 @@ class OrderBot:
         return lines
 
     # -- Telegram transport --------------------------------------------
-    def api(self, method, payload):
+    def api(self, method, payload, timeout=10):
         data = urllib.parse.urlencode(payload).encode()
         req = urllib.request.Request(API + self.token + "/" + method, data=data)
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read())
 
     def send(self, chat_id, text, reply_markup=None):
@@ -804,7 +804,10 @@ class OrderBot:
                     pass
 
     def poll_once(self):
-        res = self.api("getUpdates", {"offset": self.offset, "timeout": 20})
+        # Long poll holds up to 20s server-side, so the HTTP timeout
+        # must be longer or every poll dies at the client timeout.
+        res = self.api("getUpdates", {"offset": self.offset, "timeout": 20},
+                       timeout=30)
         for upd in res.get("result", []):
             self.offset = upd["update_id"] + 1
             self.handle_update(upd)

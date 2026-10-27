@@ -364,6 +364,30 @@ class OrderBotTest(unittest.TestCase):
         cmds = [c["command"] for c in json.loads(calls[0][1]["commands"])]
         self.assertNotIn("admin", cmds)
 
+    # -- polling (Oracle VM path): getUpdates loop ----------------------
+    def test_poll_once_delivers_update_and_advances_offset(self):
+        bot = self.make_bot()
+        script = [
+            {"ok": True, "result": [
+                {"update_id": 41,
+                 "message": {"chat": {"id": 999}, "text": "/start"}}]},
+            {"ok": True, "result": []},
+        ]
+        seen = []
+
+        def fake_api(method, payload, timeout=10):
+            seen.append((method, payload, timeout))
+            return script.pop(0)
+
+        bot.api = fake_api
+        bot.poll_once()
+        self.assertEqual(bot.offset, 42)
+        self.assertIn("Welcome", self.sender.texts()[-1])
+        self.assertEqual(seen[0][0], "getUpdates")
+        self.assertEqual(seen[0][2], 30)  # HTTP timeout > 20s long poll
+        bot.poll_once()
+        self.assertEqual(bot.offset, 42)  # empty poll changes nothing
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
